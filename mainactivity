@@ -1,0 +1,952 @@
+package com.example.braillex
+
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothSocket
+import android.content.Context
+import android.content.Intent
+import android.os.Bundle
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
+import android.util.Log
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.ExperimentalAnimationApi
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.io.InputStream
+import java.io.OutputStream
+import java.io.OutputStreamWriter
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.*
+import androidx.activity.compose.rememberLauncherForActivityResult
+
+// --- CONFIGURATION & CONSTANTS ---
+const val API_KEY = "AIzaSyBhEY6TUzEFH-dxXg2QjJDgMNl1IioG5dU" // Replace with actual API Key securely
+const val SERVO_DOWN = 90
+const val SERVO_UP = 120
+
+val BRAILLE_DICT = mapOf(
+    'A' to listOf(1,0,0,0,0,0), 'B' to listOf(1,1,0,0,0,0), 'C' to listOf(1,0,0,1,0,0), 'D' to listOf(1,0,0,1,1,0),
+    'E' to listOf(1,0,0,0,1,0), 'F' to listOf(1,1,0,1,0,0), 'G' to listOf(1,1,0,1,1,0), 'H' to listOf(1,1,0,0,1,0),
+    'I' to listOf(0,1,0,1,0,0), 'J' to listOf(0,1,0,1,1,0), 'K' to listOf(1,0,1,0,0,0), 'L' to listOf(1,1,1,0,0,0),
+    'M' to listOf(1,0,1,1,0,0), 'N' to listOf(1,0,1,1,1,0), 'O' to listOf(1,0,1,0,1,0), 'P' to listOf(1,1,1,1,0,0),
+    'Q' to listOf(1,1,1,1,1,0), 'R' to listOf(1,1,1,0,1,0), 'S' to listOf(0,1,1,1,0,0), 'T' to listOf(0,1,1,1,1,0),
+    'U' to listOf(1,0,1,0,0,1), 'V' to listOf(1,1,1,0,0,1), 'W' to listOf(0,1,0,1,1,1), 'X' to listOf(1,0,1,1,0,1),
+    'Y' to listOf(1,0,1,1,1,1), 'Z' to listOf(1,0,1,0,1,1), ' ' to listOf(0,0,0,0,0,0)
+)
+val REVERSE_DICT = BRAILLE_DICT.entries.associate { it.value.joinToString(",") to it.key }
+
+enum class AppState { DISCONNECTED, MENU, BRAILLE_TO_TEXT, TEXT_TO_BRAILLE, TUTOR_MODE, AI_MODE, DEBUG }
+val MENU_OPTIONS = listOf(
+    AppState.BRAILLE_TO_TEXT to "Write Mode",
+    AppState.TEXT_TO_BRAILLE to "Read Mode",
+    AppState.TUTOR_MODE to "Tutor Mode",
+    AppState.AI_MODE to "AI Assistant",
+    AppState.DEBUG to "Developer Debug"
+)
+val READ_MODES = listOf("MANUAL", "SENSOR", "AUTO")
+
+// --- VIEWMODEL ---
+@SuppressLint("MissingPermission") // Permissions handled in Manifest & Activity level
+class BrailleXViewModel : ViewModel(), TextToSpeech.OnInitListener {
+    var appState by mutableStateOf(AppState.DISCONNECTED)
+    var menuIndex by mutableStateOf(0)
+    var isAutoMode by mutableStateOf(false)
+    var currentReadMode by mutableStateOf(0)
+
+    var b2tText by mutableStateOf("")
+    var t2bTargetText by mutableStateOf("HELLO")
+    var t2bIndex by mutableStateOf(0)
+    var isT2BStarted by mutableStateOf(false)
+    var tutorTarget by mutableStateOf('A')
+    var tutorScore by mutableStateOf(0)
+    var chordBuffer by mutableStateOf(listOf(0, 0, 0, 0, 0, 0))
+    var aiResponse by mutableStateOf("")
+
+    var serialLogs = mutableStateListOf<String>()
+
+    private var tts: TextToSpeech? = null
+    private var autoSubmitJob: Job? = null
+    private var idleJob: Job? = null
+
+    // Touch & Nav tracking
+    private val touchStates = mutableListOf(0, 0, 0)
+    private var wasAnyTouchActive = false
+
+    // Bluetooth Variables
+    private var btSocket: BluetoothSocket? = null
+    private var btInput: InputStream? = null
+    private var btOutput: OutputStream? = null
+    private var isBtConnected = false
+
+    fun initTTS(context: Context) {
+        tts = TextToSpeech(context, this)
+    }
+
+    override fun onInit(status: Int) {
+        if (status == TextToSpeech.SUCCESS) {
+            tts?.language = Locale.US
+        }
+    }
+
+    fun speak(text: String, flush: Boolean = true) {
+        val queueMode = if (flush) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+        tts?.speak(text, queueMode, null, null)
+        addLog("TTS: $text", "system")
+    }
+
+    fun addLog(msg: String, type: String = "info") {
+        viewModelScope.launch {
+            if (serialLogs.size > 50) serialLogs.removeAt(serialLogs.size - 1)
+            serialLogs.add(0, "[$type] $msg")
+        }
+    }
+
+    // --- HARDWARE ACTIONS ---
+    fun sendSerial(cmd: String) {
+        addLog("TX: $cmd", "tx")
+        if (isBtConnected) {
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    btOutput?.write(("$cmd\n").toByteArray())
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) {
+                        addLog("TX Error: ${e.message}", "error")
+                    }
+                }
+            }
+        }
+    }
+
+    private fun sendServo(id: Int, angle: Int) {
+        sendSerial("S$id:$angle")
+    }
+
+    fun connectDevice(context: Context) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                addLog("CONNECT BUTTON PRESSED", "system")
+
+                val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+                val adapter = bluetoothManager.adapter ?: throw Exception("Bluetooth not supported")
+
+                val devices = adapter.bondedDevices.toList()
+
+                if (devices.isEmpty()) {
+                    throw Exception("No paired Bluetooth devices found")
+                }
+
+                addLog("Paired devices: ${devices.map { it.name }}", "system")
+
+                val device = devices.firstOrNull { it.name?.contains("BrailleX") == true }
+                    ?: throw Exception("BrailleX device not found")
+
+                // Standard SPP UUID
+                val uuid = UUID.fromString("00001101-0000-1000-8000-00805f9b34fb")
+
+                // IMPORTANT: Cancel discovery before attempting to connect
+                adapter.cancelDiscovery()
+
+                addLog("Trying to connect to ${device.name}", "system")
+
+                try {
+                    btSocket = device.createRfcommSocketToServiceRecord(uuid)
+                    btSocket?.connect()
+                } catch (e: Exception) {
+                    addLog("Secure socket failed, trying fallback", "system")
+
+                    try {
+                        val method = device.javaClass.getMethod(
+                            "createRfcommSocket",
+                            Int::class.javaPrimitiveType
+                        )
+                        btSocket = method.invoke(device, 1) as BluetoothSocket
+                        btSocket?.connect()
+                    } catch (fallbackEx: Exception) {
+                        throw Exception("Both connection methods failed.")
+                    }
+                }
+
+                addLog("Bluetooth socket connected", "system")
+
+                btInput = btSocket?.inputStream
+                btOutput = btSocket?.outputStream
+                isBtConnected = true
+
+                withContext(Dispatchers.Main) {
+                    appState = AppState.MENU
+                    speak("BrailleX connected via Bluetooth. Three navigation buttons on top. Six braille dots below. System is entirely controlled via the navigation buttons.")
+                    resetIdleTimer()
+                }
+
+                startBluetoothReadThread()
+
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    addLog("Connection Failed: ${e.message}", "error")
+                    speak("Connection failed. Check Bluetooth pairing.")
+                }
+            }
+        }
+    }
+
+    private fun startBluetoothReadThread() {
+        Thread {
+            val buffer = ByteArray(1024)
+            var leftover = ""
+
+            while (isBtConnected) {
+                try {
+                    val bytes = btInput?.read(buffer) ?: -1
+                    if (bytes > 0) {
+                        val chunk = String(buffer, 0, bytes)
+                        val fullStream = leftover + chunk
+                        val messages = fullStream.split("\n")
+
+                        // Keep the last part if it doesn't end with a newline
+                        leftover = if (fullStream.endsWith("\n")) "" else messages.last()
+
+                        // Process complete lines
+                        for (i in 0 until (if (leftover.isEmpty()) messages.size else messages.size - 1)) {
+                            val msg = messages[i].trim()
+                            if (msg.isNotEmpty()) {
+                                viewModelScope.launch(Dispatchers.Main) {
+                                    handleIncomingSerial(msg)
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    isBtConnected = false
+                    viewModelScope.launch(Dispatchers.Main) {
+                        addLog("BT Disconnected", "error")
+                        appState = AppState.DISCONNECTED
+                    }
+                    break
+                }
+            }
+        }.start()
+    }
+
+    fun handleIncomingSerial(data: String) {
+        addLog(data, "rx")
+        resetIdleTimer()
+
+        // 1. BRAILLE BUTTONS
+        val btnMatch = Regex("^B([1-6])_(PRESS|RELEASE)$").find(data)
+        if (btnMatch != null) {
+            val dotIndex = btnMatch.groupValues[1].toInt() - 1
+            val isPress = btnMatch.groupValues[2] == "PRESS"
+
+            if (isPress) {
+                val newBuffer = chordBuffer.toMutableList()
+                newBuffer[dotIndex] = if (newBuffer[dotIndex] == 1) 0 else 1
+                chordBuffer = newBuffer
+
+                if (chordBuffer[dotIndex] == 1) {
+                    speak("Dot ${dotIndex + 1}")
+                    sendServo(dotIndex + 1, SERVO_UP)
+                } else {
+                    speak("Dot ${dotIndex + 1} released")
+                    sendServo(dotIndex + 1, SERVO_DOWN)
+                }
+                sendSerial("VIB:DOT")
+                if (isAutoMode) resetAutoSubmitTimer()
+            }
+            return
+        }
+
+        // 2. TOUCH SENSORS
+        val touchMatch = Regex("^T([1-3])_(PRESS|RELEASE)$").find(data)
+        if (touchMatch != null) {
+            val index = touchMatch.groupValues[1].toInt() - 1
+            val isPress = touchMatch.groupValues[2] == "PRESS"
+            touchStates[index] = if (isPress) 1 else 0
+
+            val anyTouchActive = touchStates.any { it == 1 }
+            if (wasAnyTouchActive && !anyTouchActive) {
+                // Lift hand logic
+                if (appState == AppState.TEXT_TO_BRAILLE && currentReadMode == 1 && isT2BStarted) {
+                    actionNext()
+                } else if (isAutoMode && (appState == AppState.BRAILLE_TO_TEXT || appState == AppState.AI_MODE)) {
+                    submitBrailleToText()
+                }
+            }
+            wasAnyTouchActive = anyTouchActive
+            return
+        }
+
+        // 3. NAV BUTTONS
+        val navMatch = Regex("^([ABC])_(PRESS)$").find(data)
+        if (navMatch != null) {
+            val btn = navMatch.groupValues[1]
+            when (btn) {
+                "A" -> actionSelect()
+                "B" -> actionBack()
+                "C" -> actionNext()
+            }
+        }
+    }
+
+    // --- CORE LOGIC ---
+    fun actionSelect() {
+        sendSerial("VIB:CONFIRM")
+        when (appState) {
+            AppState.MENU -> {
+                appState = MENU_OPTIONS[menuIndex].first
+                speak("Opening ${MENU_OPTIONS[menuIndex].second}")
+                resetContext()
+            }
+            AppState.BRAILLE_TO_TEXT -> submitBrailleToText()
+            AppState.TUTOR_MODE -> submitTutorChord()
+            AppState.AI_MODE -> {
+                if (chordBuffer.any { it == 1 }) submitBrailleToText()
+                else if (b2tText.isNotEmpty()) askAI(b2tText)
+            }
+            AppState.TEXT_TO_BRAILLE -> {
+                if (!isT2BStarted) {
+                    isT2BStarted = true
+                    readCurrentT2BLetter()
+                } else actionNext()
+            }
+            else -> {}
+        }
+    }
+
+    fun actionBack() {
+        sendSerial("VIB:CANCEL")
+        if (appState == AppState.MENU) {
+            speak("Already at main menu")
+        } else {
+            speak("Back to menu")
+            appState = AppState.MENU
+        }
+    }
+
+    fun actionNext() {
+        when (appState) {
+            AppState.MENU -> {
+                menuIndex = (menuIndex + 1) % MENU_OPTIONS.size
+                speak("Menu ${MENU_OPTIONS[menuIndex].second}")
+            }
+            AppState.BRAILLE_TO_TEXT -> speak(if (b2tText.isEmpty()) "No text" else "Text is $b2tText")
+            AppState.TEXT_TO_BRAILLE -> {
+                if (!isT2BStarted) {
+                    isT2BStarted = true
+                    readCurrentT2BLetter()
+                } else if (t2bIndex < t2bTargetText.length - 1) {
+                    t2bIndex++
+                    readCurrentT2BLetter()
+                } else {
+                    speak("End of text")
+                }
+            }
+            AppState.TUTOR_MODE -> {
+                speak("Skipping letter")
+                nextTutorLetter()
+            }
+            else -> {}
+        }
+    }
+
+    fun submitBrailleToText() {
+        if (chordBuffer.all { it == 0 }) return
+        val letter = REVERSE_DICT[chordBuffer.joinToString(",")]
+        if (letter != null) {
+            b2tText += letter
+            speak("Character ${if (letter == ' ') "space" else letter}")
+        } else {
+            speak("Unknown character")
+            sendSerial("VIB:ERROR")
+        }
+        chordBuffer = listOf(0, 0, 0, 0, 0, 0)
+        resetServos()
+    }
+
+    private fun readCurrentT2BLetter() {
+        if (t2bTargetText.isEmpty()) return
+        val letter = t2bTargetText[t2bIndex]
+        speak("Letter ${if (letter == ' ') "space" else letter}")
+        val chord = BRAILLE_DICT[letter] ?: listOf(0, 0, 0, 0, 0, 0)
+        sendSerial("CHORD:${chord.joinToString("")}")
+        resetAutoSubmitTimer()
+    }
+
+    private fun nextTutorLetter() {
+        val keys = BRAILLE_DICT.keys.filter { it != ' ' }
+        tutorTarget = keys.random()
+        chordBuffer = listOf(0, 0, 0, 0, 0, 0)
+        speak("Type letter $tutorTarget")
+    }
+
+    private fun submitTutorChord() {
+        val target = BRAILLE_DICT[tutorTarget]
+        val isCorrect = chordBuffer == target
+        val entered = REVERSE_DICT[chordBuffer.joinToString(",")] ?: "unknown"
+
+        if (isCorrect) {
+            tutorScore++
+            speak("$entered. Correct. Score $tutorScore")
+            viewModelScope.launch {
+                delay(2000)
+                nextTutorLetter()
+            }
+        } else {
+            speak("$entered. Incorrect. Try again.")
+            sendSerial("VIB:ERROR")
+        }
+        chordBuffer = listOf(0, 0, 0, 0, 0, 0)
+        resetServos()
+    }
+
+    fun askAI(prompt: String) {
+        aiResponse = "Thinking..."
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val url = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$API_KEY")
+                val conn = url.openConnection() as HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.doOutput = true
+
+                val payload = """
+                    {"contents":[{"parts":[{"text":"You are BrailleX, an assistant for a blind user. Answer very shortly in simple words, max 10 words. Prompt: $prompt"}]}]}
+                """.trimIndent()
+
+                OutputStreamWriter(conn.outputStream).use { it.write(payload) }
+
+                val responseStr = conn.inputStream.bufferedReader().use { it.readText() }
+                val json = JSONObject(responseStr)
+                val text = json.getJSONArray("candidates")
+                    .getJSONObject(0)
+                    .getJSONObject("content")
+                    .getJSONArray("parts")
+                    .getJSONObject(0)
+                    .getString("text")
+
+                withContext(Dispatchers.Main) {
+                    aiResponse = text
+                    speak(text)
+                    sendSerial("TXT:${text.take(16)}")
+                    b2tText = ""
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    aiResponse = "Network Error"
+                    speak("AI Error")
+                    sendSerial("VIB:ERROR")
+                }
+            }
+        }
+    }
+
+    private fun resetContext() {
+        b2tText = ""
+        chordBuffer = listOf(0, 0, 0, 0, 0, 0)
+        aiResponse = ""
+        t2bIndex = 0
+        isT2BStarted = false
+        if (appState == AppState.TUTOR_MODE) {
+            tutorScore = 0
+            nextTutorLetter()
+        }
+        resetServos()
+    }
+
+    private fun resetServos() {
+        for (i in 1..6) sendServo(i, SERVO_DOWN)
+    }
+
+    private fun resetAutoSubmitTimer() {
+        autoSubmitJob?.cancel()
+        if (appState == AppState.TEXT_TO_BRAILLE && currentReadMode == 2 && isT2BStarted) {
+            autoSubmitJob = viewModelScope.launch {
+                delay(3000)
+                actionNext()
+            }
+        } else if (isAutoMode && (appState == AppState.BRAILLE_TO_TEXT || appState == AppState.AI_MODE)) {
+            autoSubmitJob = viewModelScope.launch {
+                delay(2500)
+                if (chordBuffer.any { it == 1 }) submitBrailleToText()
+            }
+        }
+    }
+
+    private fun resetIdleTimer() {
+        idleJob?.cancel()
+        if (appState != AppState.DISCONNECTED) {
+            idleJob = viewModelScope.launch {
+                delay(15000)
+                speak("Current state is ${appState.name}")
+            }
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        try {
+            btSocket?.close()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+}
+
+// --- UI COMPONENTS (JETPACK COMPOSE) ---
+class MainActivity : ComponentActivity() {
+
+    private val bluetoothPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
+            val granted =
+                permissions[android.Manifest.permission.BLUETOOTH_CONNECT] == true &&
+                        permissions[android.Manifest.permission.BLUETOOTH_SCAN] == true
+            if (!granted) {
+                Log.e("BrailleX", "Bluetooth permission denied")
+            }
+        }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        bluetoothPermissionLauncher.launch(
+            arrayOf(
+                android.Manifest.permission.BLUETOOTH_CONNECT,
+                android.Manifest.permission.BLUETOOTH_SCAN
+            )
+        )
+
+        setContent {
+            val viewModel: BrailleXViewModel = viewModel()
+            val context = LocalContext.current
+
+            LaunchedEffect(Unit) {
+                viewModel.initTTS(context)
+            }
+
+            // Speech Recognizer Launcher
+            val speechLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.StartActivityForResult()
+            ) { result ->
+                if (result.resultCode == android.app.Activity.RESULT_OK) {
+                    val data = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+                    val text = data?.get(0) ?: ""
+                    if (viewModel.appState == AppState.TEXT_TO_BRAILLE) {
+                        viewModel.t2bTargetText = text.uppercase()
+                        viewModel.speak("Text loaded. Press A to start.")
+                    } else if (viewModel.appState == AppState.AI_MODE) {
+                        viewModel.askAI(text)
+                    }
+                }
+            }
+
+            MaterialTheme(
+                colorScheme = darkColorScheme(
+                    background = Color.Black,
+                    surface = Color.Black,
+                    onBackground = Color.White,
+                    onSurface = Color.White
+                )
+            ) {
+                Scaffold(
+                    topBar = { TopHeader(viewModel) },
+                    containerColor = Color.Black,
+                    contentColor = Color.White
+                ) { paddingValues ->
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(paddingValues)
+                            .padding(16.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        // Smooth animated transitions for accessibility & UX
+                        AnimatedContent(
+                            targetState = viewModel.appState,
+                            transitionSpec = { fadeIn(tween(300)) togetherWith fadeOut(tween(300)) },
+                            label = "ScreenTransition"
+                        ) { state ->
+                            when (state) {
+                                AppState.DISCONNECTED -> DisconnectedScreen(viewModel)
+                                AppState.MENU -> MenuScreen(viewModel)
+                                AppState.BRAILLE_TO_TEXT -> WriteScreen(viewModel)
+                                AppState.TEXT_TO_BRAILLE -> ReadScreen(viewModel, onDictate = {
+                                    val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                                        putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                                    }
+                                    speechLauncher.launch(intent)
+                                })
+                                AppState.TUTOR_MODE -> TutorScreen(viewModel)
+                                AppState.AI_MODE -> AIScreen(viewModel, onDictate = {
+                                    val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                                        putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                                    }
+                                    speechLauncher.launch(intent)
+                                })
+                                AppState.DEBUG -> DebugScreen(viewModel)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun TopHeader(viewModel: BrailleXViewModel) {
+    // Merged semantics so TalkBack reads the whole header clearly as one block
+    Surface(
+        color = Color.Black,
+        modifier = Modifier
+            .fillMaxWidth()
+            .shadow(4.dp)
+            .semantics(mergeDescendants = true) {
+                contentDescription = "Braille X Application. Current state: ${viewModel.appState.name.replace("_", " ")}"
+            }
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .border(
+                    width = 2.dp,
+                    color = Color.White,
+                    shape = RoundedCornerShape(bottomStart = 16.dp, bottomEnd = 16.dp)
+                )
+                .padding(16.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(16.dp)
+                        .clip(CircleShape)
+                        .background(if (viewModel.appState == AppState.DISCONNECTED) Color.DarkGray else Color.White)
+                )
+                Spacer(modifier = Modifier.width(16.dp))
+                Text("BRAILLEX", fontWeight = FontWeight.Black, fontSize = 24.sp, letterSpacing = 4.sp)
+            }
+            Text(
+                text = viewModel.appState.name,
+                color = Color.Black,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color.White)
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                fontWeight = FontWeight.Bold,
+                fontSize = 12.sp
+            )
+        }
+    }
+}
+
+@Composable
+fun DisconnectedScreen(viewModel: BrailleXViewModel) {
+    val context = LocalContext.current
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(
+            "OFFLINE",
+            fontSize = 32.sp,
+            fontWeight = FontWeight.Black,
+            color = Color.White,
+            modifier = Modifier.semantics { heading() }
+        )
+        Spacer(modifier = Modifier.height(32.dp))
+        Button(
+            onClick = { viewModel.connectDevice(context) },
+            colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black),
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.fillMaxWidth(0.8f).height(64.dp)
+        ) {
+            Text("CONNECT BLUETOOTH", fontWeight = FontWeight.Black, fontSize = 20.sp)
+        }
+    }
+}
+
+@Composable
+fun MenuScreen(viewModel: BrailleXViewModel) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth(0.9f)) {
+        Text(
+            "MAIN MENU",
+            fontSize = 28.sp,
+            fontWeight = FontWeight.Black,
+            modifier = Modifier
+                .padding(bottom = 24.dp)
+                .semantics { heading() }
+        )
+        MENU_OPTIONS.forEachIndexed { index, option ->
+            val isSelected = index == viewModel.menuIndex
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    // Accessibility specific click handling
+                    .clickable(
+                        role = Role.Button,
+                        onClickLabel = "Open ${option.second}"
+                    ) {
+                        viewModel.menuIndex = index
+                        viewModel.actionSelect()
+                    }
+                    .border(
+                        width = if (isSelected) 4.dp else 2.dp,
+                        color = if (isSelected) Color.White else Color.DarkGray,
+                        shape = RoundedCornerShape(16.dp)
+                    )
+                    .background(if (isSelected) Color.White else Color.Black)
+                    .padding(20.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = option.second.uppercase(),
+                    color = if (isSelected) Color.Black else Color.Gray,
+                    fontWeight = FontWeight.Black,
+                    fontSize = 20.sp,
+                    textAlign = TextAlign.Center
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(32.dp))
+        // On-screen hardware simulation clearly labeled
+        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            OutlinedButton(
+                onClick = { viewModel.actionNext() },
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
+            ) { Text("Simulate C (Next)") }
+            OutlinedButton(
+                onClick = { viewModel.actionSelect() },
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
+            ) { Text("Simulate A (Select)") }
+        }
+    }
+}
+
+@Composable
+fun WriteScreen(viewModel: BrailleXViewModel) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+        Text("WRITE MODE", fontSize = 24.sp, fontWeight = FontWeight.Black, modifier = Modifier.semantics { heading() })
+        Spacer(modifier = Modifier.height(16.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth(0.9f)
+                .clip(RoundedCornerShape(16.dp))
+                .border(4.dp, Color.White, RoundedCornerShape(16.dp))
+                .padding(24.dp)
+                .semantics {
+                    contentDescription = "Typed text: ${viewModel.b2tText.ifEmpty { "Empty" }}"
+                },
+            contentAlignment = Alignment.Center
+        ) {
+            Text(viewModel.b2tText.ifEmpty { "..." }, fontSize = 40.sp, fontWeight = FontWeight.Black, letterSpacing = 8.sp)
+        }
+        Spacer(modifier = Modifier.height(32.dp))
+        BrailleDotsDisplay(viewModel.chordBuffer)
+    }
+}
+
+@Composable
+fun ReadScreen(viewModel: BrailleXViewModel, onDictate: () -> Unit) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth(0.9f)) {
+        Text("READ MODE", fontSize = 24.sp, fontWeight = FontWeight.Black, modifier = Modifier.semantics { heading() })
+        Spacer(modifier = Modifier.height(16.dp))
+        Button(
+            onClick = onDictate,
+            colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("DICTATE TEXT", modifier = Modifier.padding(8.dp))
+        }
+        Spacer(modifier = Modifier.height(16.dp))
+        val currentLetter = if (viewModel.t2bTargetText.isNotEmpty() && viewModel.t2bIndex < viewModel.t2bTargetText.length)
+            viewModel.t2bTargetText[viewModel.t2bIndex].toString() else ""
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(16.dp))
+                .border(4.dp, Color.DarkGray, RoundedCornerShape(16.dp))
+                .padding(32.dp)
+                .semantics { contentDescription = "Current reading letter: $currentLetter" },
+            contentAlignment = Alignment.Center
+        ) {
+            Text(currentLetter, fontSize = 60.sp, fontWeight = FontWeight.Black, color = Color.White)
+        }
+        Spacer(modifier = Modifier.height(32.dp))
+        val expectedChord = if (!viewModel.isT2BStarted || currentLetter.isEmpty()) listOf(0,0,0,0,0,0)
+        else BRAILLE_DICT[currentLetter[0]] ?: listOf(0,0,0,0,0,0)
+        BrailleDotsDisplay(expectedChord)
+    }
+}
+
+@Composable
+fun TutorScreen(viewModel: BrailleXViewModel) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text("TUTOR", fontSize = 24.sp, fontWeight = FontWeight.Black, modifier = Modifier.semantics { heading() })
+        Spacer(modifier = Modifier.height(16.dp))
+        Box(
+            modifier = Modifier
+                .clip(RoundedCornerShape(16.dp))
+                .border(4.dp, Color.White, RoundedCornerShape(16.dp))
+                .padding(40.dp)
+                .semantics { contentDescription = "Target letter is ${viewModel.tutorTarget}" },
+            contentAlignment = Alignment.Center
+        ) {
+            Text(viewModel.tutorTarget.toString(), fontSize = 80.sp, fontWeight = FontWeight.Black)
+        }
+        Spacer(modifier = Modifier.height(32.dp))
+        BrailleDotsDisplay(viewModel.chordBuffer)
+        Spacer(modifier = Modifier.height(32.dp))
+        Text(
+            "SCORE: ${viewModel.tutorScore}",
+            fontSize = 24.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.semantics { contentDescription = "Current score is ${viewModel.tutorScore}" }
+        )
+    }
+}
+
+@Composable
+fun AIScreen(viewModel: BrailleXViewModel, onDictate: () -> Unit) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth(0.9f)) {
+        Text("A.I. ASSISTANT", fontSize = 24.sp, fontWeight = FontWeight.Black, modifier = Modifier.semantics { heading() })
+        Spacer(modifier = Modifier.height(16.dp))
+        Button(
+            onClick = onDictate,
+            colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("TAP TO SPEAK", modifier = Modifier.padding(8.dp))
+        }
+        Spacer(modifier = Modifier.height(16.dp))
+        if (viewModel.b2tText.isNotEmpty()) {
+            Text(viewModel.b2tText, fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(16.dp))
+        }
+        BrailleDotsDisplay(viewModel.chordBuffer)
+        Spacer(modifier = Modifier.height(32.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .border(2.dp, Color.Gray, RoundedCornerShape(12.dp))
+                .padding(16.dp)
+                .semantics { contentDescription = "A I response: ${viewModel.aiResponse}" }
+        ) {
+            Text(viewModel.aiResponse.ifEmpty { "Awaiting input..." }, fontSize = 18.sp, color = Color.White)
+        }
+    }
+}
+
+@Composable
+fun DebugScreen(viewModel: BrailleXViewModel) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+        Text("DEBUG SYSTEM", fontSize = 24.sp, fontWeight = FontWeight.Black, modifier = Modifier.semantics { heading() })
+        Spacer(modifier = Modifier.height(16.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            Button(onClick = { viewModel.sendSerial("VIB:CONFIRM") }) { Text("Vib OK") }
+            Button(onClick = { viewModel.sendSerial("VIB:ERROR") }) { Text("Vib ERR") }
+        }
+        Spacer(modifier = Modifier.height(16.dp))
+        LazyColumn(Modifier.fillMaxWidth().height(200.dp).border(2.dp, Color.Gray, RoundedCornerShape(8.dp)).padding(8.dp)) {
+            items(viewModel.serialLogs) { log ->
+                Text(log, fontSize = 10.sp, color = Color.Green, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace)
+            }
+        }
+        Spacer(modifier = Modifier.height(16.dp))
+        Button(onClick = { viewModel.actionBack() }) { Text("Simulate B (Back)") }
+    }
+}
+
+@Composable
+fun BrailleDotsDisplay(chord: List<Int>) {
+    val order = listOf(0, 3, 1, 4, 2, 5) // Matches braille physical numbering
+    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        for (row in 0..2) {
+            Row(horizontalArrangement = Arrangement.spacedBy(40.dp)) {
+                val leftIdx = order[row * 2]
+                val rightIdx = order[row * 2 + 1]
+
+                // Pass dot numbers (1 to 6) to the UI for correct Semantic descriptions
+                Dot(dotNumber = leftIdx + 1, isActive = chord[leftIdx] == 1)
+                Dot(dotNumber = rightIdx + 1, isActive = chord[rightIdx] == 1)
+            }
+        }
+    }
+}
+
+@Composable
+fun Dot(dotNumber: Int, isActive: Boolean) {
+    Box(
+        modifier = Modifier
+            .size(56.dp) // Larger 56dp size for better tactile representation and touch target
+            .clip(CircleShape)
+            .background(if (isActive) Color.White else Color.DarkGray)
+            .border(4.dp, if (isActive) Color.White else Color.Gray, CircleShape)
+            .shadow(if (isActive) 12.dp else 0.dp, CircleShape)
+            // Critical accessibility upgrade: TalkBack explicitly reads dot status.
+            .semantics {
+                contentDescription = "Braille Dot $dotNumber, ${if (isActive) "Active" else "Inactive"}"
+            }
+    )
+}
+
+// --- COMPOSE PREVIEWS ---
+@Preview(showBackground = true, backgroundColor = 0xFF000000)
+@Composable
+fun PreviewDisconnectedScreen() {
+    MaterialTheme(colorScheme = darkColorScheme(background = Color.Black)) {
+        DisconnectedScreen(viewModel = BrailleXViewModel())
+    }
+}
+
+@Preview(showBackground = true, backgroundColor = 0xFF000000)
+@Composable
+fun PreviewMenuScreen() {
+    val vm = BrailleXViewModel().apply { appState = AppState.MENU }
+    MaterialTheme(colorScheme = darkColorScheme(background = Color.Black)) {
+        MenuScreen(viewModel = vm)
+    }
+}
