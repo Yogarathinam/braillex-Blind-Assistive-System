@@ -1,0 +1,1012 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BrailleX Companion App</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; user-select: none; background-color: #000; color: #fff; }
+        
+        /* High Contrast Braille Dots */
+        .dot { width: 3rem; height: 3rem; border-radius: 50%; transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); border: 2px solid #333; }
+        .dot.active { background-color: #fff; box-shadow: 0 0 20px rgba(255, 255, 255, 0.9); border-color: #fff; transform: scale(1.1); }
+        .dot.inactive { background-color: #111; box-shadow: inset 0 4px 6px rgba(0,0,0,0.8); }
+        
+        /* Layout Utilities */
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #000; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #fff; border-radius: 2px; }
+        
+        /* Side Panel Animation */
+        #serial-monitor { transition: transform 0.3s ease-in-out; }
+        .monitor-open { transform: translateX(0) !important; }
+    </style>
+</head>
+<body class="h-screen flex flex-col overflow-hidden selection:bg-white selection:text-black relative">
+
+    <!-- Top Header -->
+    <header class="bg-black p-4 flex justify-between items-center border-b-2 border-white z-20 relative">
+        <div class="flex items-center gap-4">
+            <div id="status-indicator" class="w-4 h-4 rounded-full bg-gray-800 border border-gray-600 transition-colors duration-300"></div>
+            <h1 class="text-2xl font-black tracking-[0.3em] uppercase">BRAILLEX</h1>
+        </div>
+        <div class="flex items-center gap-4">
+            <div id="state-badge" class="text-xs font-bold tracking-widest bg-white text-black px-4 py-1.5 uppercase border-2 border-transparent">DISCONNECTED</div>
+            <button onclick="toggleSerialMonitor()" class="p-1.5 border-2 border-white hover:bg-white hover:text-black transition-colors focus:outline-none" title="Toggle Logs">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter"><line x1="4" y1="6" x2="20" y2="6"></line><line x1="4" y1="12" x2="20" y2="12"></line><line x1="4" y1="18" x2="20" y2="18"></line></svg>
+            </button>
+        </div>
+    </header>
+
+    <!-- Serial Monitor Side Panel -->
+    <aside id="serial-monitor" class="fixed right-0 top-0 h-full w-80 bg-black border-l-2 border-white transform translate-x-full z-50 flex flex-col shadow-[0_0_30px_rgba(255,255,255,0.1)]">
+        <div class="p-4 border-b-2 border-white flex justify-between items-center bg-black">
+            <h3 class="text-sm font-bold tracking-widest uppercase">Hardware Logs</h3>
+            <button onclick="toggleSerialMonitor()" class="text-white hover:text-gray-400">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+            </button>
+        </div>
+        <div id="logs" class="flex-1 overflow-y-auto p-3 custom-scrollbar font-mono text-[10px] flex flex-col-reverse gap-1"></div>
+    </aside>
+
+    <!-- Main Content Area -->
+    <main id="main-area" class="flex-1 relative flex flex-col items-center justify-center p-4 touch-none overflow-hidden z-10">
+        <div id="content-container" class="w-full max-w-2xl text-center h-full flex flex-col justify-between">
+            <!-- Content Injected via JS -->
+        </div>
+    </main>
+
+    <script>
+        // --- CONFIGURATION & DICTIONARIES ---
+        const apiKey = "AIzaSyBhEY6TUzEFH-dxXg2QjJDgMNl1IioG5dU"; // Keep empty as requested by standards, inject via runtime
+        const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+
+        const SERVO_DOWN = 90;
+        const SERVO_UP = 120;
+
+        const BRAILLE_DICT = {
+            'A': [1,0,0,0,0,0], 'B': [1,1,0,0,0,0], 'C': [1,0,0,1,0,0], 'D': [1,0,0,1,1,0],
+            'E': [1,0,0,0,1,0], 'F': [1,1,0,1,0,0], 'G': [1,1,0,1,1,0], 'H': [1,1,0,0,1,0],
+            'I': [0,1,0,1,0,0], 'J': [0,1,0,1,1,0], 'K': [1,0,1,0,0,0], 'L': [1,1,1,0,0,0],
+            'M': [1,0,1,1,0,0], 'N': [1,0,1,1,1,0], 'O': [1,0,1,0,1,0], 'P': [1,1,1,1,0,0],
+            'Q': [1,1,1,1,1,0], 'R': [1,1,1,0,1,0], 'S': [0,1,1,1,0,0], 'T': [0,1,1,1,1,0],
+            'U': [1,0,1,0,0,1], 'V': [1,1,1,0,0,1], 'W': [0,1,0,1,1,1], 'X': [1,0,1,1,0,1],
+            'Y': [1,0,1,1,1,1], 'Z': [1,0,1,0,1,1], ' ': [0,0,0,0,0,0]
+        };
+
+        const REVERSE_DICT = {};
+        for (const [letter, chord] of Object.entries(BRAILLE_DICT)) {
+            REVERSE_DICT[chord.join(',')] = letter;
+        }
+
+        const STATES = {
+            DISCONNECTED: 'DISCONNECTED',
+            MENU: 'MENU',
+            BRAILLE_TO_TEXT: 'BRAILLE_TO_TEXT',
+            TEXT_TO_BRAILLE: 'TEXT_TO_BRAILLE',
+            TUTOR_MODE: 'TUTOR_MODE',
+            AI_MODE: 'AI_MODE',
+            DEBUG: 'DEBUG'
+        };
+
+        const MENU_OPTIONS = [
+            { id: 'BRAILLE_TO_TEXT', label: 'Write Mode' },
+            { id: 'TEXT_TO_BRAILLE', label: 'Read Mode' },
+            { id: 'TUTOR_MODE', label: 'Tutor Mode' },
+            { id: 'AI_MODE', label: 'AI Assistant' },
+            { id: 'DEBUG', label: 'Developer Debug' }
+        ];
+
+        const READ_MODES = ["MANUAL", "SENSOR", "AUTO"];
+
+        // --- GLOBAL STATE ---
+        let appState = STATES.DISCONNECTED;
+        let serialPort = null;
+        let serialWriter = null;
+        let serialReader = null;
+        
+        let chordBuffer = [0, 0, 0, 0, 0, 0];
+        let menuIndex = 0;
+        let isAutoMode = false; // For Write and AI modes
+        let currentReadMode = 0; // 0: Manual, 1: Sensor, 2: Auto
+        
+        // Context States
+        let b2t_Text = ""; 
+        let t2b_TargetText = "HELLO"; 
+        let t2b_Index = 0;
+        let isT2BStarted = false; // Tracks if reading has begun
+        let tutorTarget = 'A';
+        let tutorScore = 0;
+
+        // Hardware Tracking
+        let touchStates = [0, 0, 0]; 
+        let wasAnyTouchActive = false; 
+
+        // Hardware Timers
+        let autoSubmitTimer = null;
+
+        // Speech Synthesis
+        const synth = window.speechSynthesis;
+        let lastSpokenText = "";
+
+        // Delay helper to prevent ESP32 brownouts and buffer overflows
+        const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+        // --- NAV BUTTON STATE MANAGER (A, B, C Multi-press & Combo detection) ---
+        const navBtnState = {
+            A: { clicks: 0, holdTimer: null, clickTimer: null, isHeld: false, isDown: false },
+            B: { clicks: 0, holdTimer: null, clickTimer: null, isHeld: false, isDown: false },
+            C: { clicks: 0, holdTimer: null, clickTimer: null, isHeld: false, isDown: false }
+        };
+
+        function handleNavButton(btn, action) {
+            handleInteractionInterrupt();
+            const state = navBtnState[btn];
+            
+            state.isDown = (action === 'PRESS');
+
+            if (action === 'PRESS') {
+                state.isHeld = false;
+                
+                state.holdTimer = setTimeout(() => {
+                    state.isHeld = true;
+
+                    // Check for A + B combo hold
+                    if ((btn === 'A' && navBtnState.B.isDown) || (btn === 'B' && navBtnState.A.isDown)) {
+                        navBtnState.A.isHeld = true;
+                        navBtnState.B.isHeld = true;
+                        if (btn === 'A') clearTimeout(navBtnState.B.holdTimer);
+                        if (btn === 'B') clearTimeout(navBtnState.A.holdTimer);
+                        speakContextHelp();
+                    } else {
+                        executeButtonHold(btn);
+                    }
+                }, 800); // 800ms for HOLD
+
+            } else if (action === 'RELEASE') {
+                clearTimeout(state.holdTimer);
+                if (!state.isHeld) {
+                    state.clicks++;
+                    clearTimeout(state.clickTimer);
+                    state.clickTimer = setTimeout(() => {
+                        const clicks = state.clicks;
+                        state.clicks = 0;
+                        if (clicks === 1) executeButtonSingle(btn);
+                        else if (clicks >= 2) executeButtonDouble(btn);
+                    }, 350); // 350ms window for DOUBLE PRESS
+                }
+            }
+        }
+
+        // --- BUTTON ACTION ROUTERS ---
+        function executeButtonSingle(btn) {
+            if (btn === 'A') actionSelect();
+            if (btn === 'B') actionBack();
+            if (btn === 'C') actionNext();
+        }
+
+        function executeButtonDouble(btn) {
+            if (btn === 'A') {
+                if (appState === STATES.TEXT_TO_BRAILLE) toggleReadMode();
+                else toggleAutoMode();
+            }
+            if (btn === 'B') actionDeleteOrPrev();
+            if (btn === 'C') readCurrentState();
+        }
+
+        function executeButtonHold(btn) {
+            if (btn === 'A') actionVoiceAssistReady();
+            if (btn === 'B') actionEmergencyExit();
+            if (btn === 'C') {
+                if (appState === STATES.TEXT_TO_BRAILLE) startT2BVoiceRecognition();
+                else speakHelpInstructions();
+            }
+        }
+
+        // --- CORE NAV ACTIONS ---
+        function actionSelect() {
+            sendSerial("VIB:CONFIRM");
+            if (appState === STATES.MENU) {
+                changeState(STATES[MENU_OPTIONS[menuIndex].id]);
+                speak(`Opening ${MENU_OPTIONS[menuIndex].label}`);
+            } else if (appState === STATES.BRAILLE_TO_TEXT) {
+                submitBrailleToText();
+            } else if (appState === STATES.TUTOR_MODE) {
+                submitTutorChord();
+            } else if (appState === STATES.AI_MODE) {
+                if (!chordBuffer.every(v => v === 0)) {
+                    submitBrailleToText();
+                } else if (b2t_Text.length > 0) {
+                    askAI(b2t_Text);
+                    b2t_Text = "";
+                    updateUI();
+                } else {
+                    speakError("Buffer empty. Shape braille to ask, or hold A to speak.");
+                }
+            } else if (appState === STATES.TEXT_TO_BRAILLE) {
+                if (!isT2BStarted) {
+                    isT2BStarted = true;
+                    readCurrentT2BLetter();
+                    updateUI();
+                } else {
+                    actionNext(); 
+                }
+            }
+        }
+
+        function actionBack() {
+            sendSerial("VIB:CANCEL");
+            if (appState === STATES.MENU) {
+                speak("Already at main menu.");
+            } else {
+                speak("Back.");
+                goToMainMenu();
+            }
+        }
+
+        function actionNext() {
+            if (appState === STATES.MENU) {
+                menuIndex = (menuIndex + 1) % MENU_OPTIONS.length;
+                announceMenu();
+                updateUI();
+            } else if (appState === STATES.BRAILLE_TO_TEXT) {
+                if(b2t_Text) speak("Text is " + b2t_Text);
+                else speak("No text yet.");
+            } else if (appState === STATES.TEXT_TO_BRAILLE) {
+                if (!isT2BStarted) {
+                    isT2BStarted = true;
+                    readCurrentT2BLetter();
+                    updateUI();
+                } else if(t2b_Index < t2b_TargetText.length - 1) {
+                    t2b_Index++;
+                    readCurrentT2BLetter();
+                    updateUI();
+                } else {
+                    speak("End of text.");
+                }
+            } else if (appState === STATES.TUTOR_MODE) {
+                speak("Skipping letter.");
+                nextTutorLetter();
+            }
+        }
+
+        function actionPrev() {
+            if (appState === STATES.MENU) {
+                menuIndex = (menuIndex - 1 + MENU_OPTIONS.length) % MENU_OPTIONS.length;
+                announceMenu();
+                updateUI();
+            } else if (appState === STATES.TEXT_TO_BRAILLE) {
+                if(t2b_Index > 0) {
+                    t2b_Index--;
+                    readCurrentT2BLetter();
+                    updateUI();
+                } else {
+                    speak("Start of text.");
+                }
+            }
+        }
+
+        function actionDeleteOrPrev() {
+            sendSerial("VIB:CANCEL");
+            if (appState === STATES.BRAILLE_TO_TEXT || appState === STATES.AI_MODE) {
+                if(b2t_Text.length > 0) {
+                    b2t_Text = b2t_Text.slice(0, -1);
+                    speak("Deleted");
+                    updateUI();
+                } else {
+                    speak("Buffer empty");
+                }
+            } else {
+                actionPrev(); // Fallback for menu/read navigation
+            }
+        }
+
+        function actionVoiceAssistReady() {
+            if (appState !== STATES.TEXT_TO_BRAILLE) {
+                speakFeedback("Voice assistant ready");
+                startVoiceAssistant();
+            }
+        }
+
+        function actionEmergencyExit() {
+            speakError("Emergency exit. Main menu.");
+            changeState(STATES.MENU);
+            announceMenu();
+        }
+
+        // --- FEEDBACK & STATE READERS ---
+        function speakContextHelp() {
+            speakFeedback("Screen Guide.");
+            switch(appState) {
+                case STATES.MENU: 
+                    speak("Main Menu. A selects option. B does nothing. C moves to next option."); 
+                    break;
+                case STATES.BRAILLE_TO_TEXT: 
+                    speak("Write Mode. A submits character. B deletes last character. C reads text. Double A toggles auto submit."); 
+                    break;
+                case STATES.TEXT_TO_BRAILLE: 
+                    speak("Read Mode. A or C starts reading or advances to next letter. Double B goes to previous. Double A cycles progression between Manual, Sensor, and Auto. Hold C to dictate text via voice."); 
+                    break;
+                case STATES.TUTOR_MODE: 
+                    speak("Tutor Mode. A submits your answer. B exits tutor. C skips the current letter."); 
+                    break;
+                case STATES.AI_MODE: 
+                    speak("AI Mode. A submits braille. Hold A to dictate. B deletes. Double A toggles auto submit."); 
+                    break;
+                case STATES.DEBUG: 
+                    speak("Debug Mode. A selects, B exits."); 
+                    break;
+                default:
+                    speak("No guide available for this screen.");
+            }
+        }
+
+        function readCurrentState(){
+            if(appState === STATES.MENU) {
+                speak("Menu. " + MENU_OPTIONS[menuIndex].label);
+            } else if(appState === STATES.BRAILLE_TO_TEXT) {
+                if(b2t_Text.length === 0) speak("Write mode. No text typed yet.");
+                else speak("Write mode. Text is " + b2t_Text);
+            } else if(appState === STATES.TEXT_TO_BRAILLE) {
+                speak("Read mode. Letter " + (t2b_TargetText[t2b_Index] || "space"));
+            } else if(appState === STATES.AI_MODE) {
+                speak("A I mode. " + (b2t_Text ? "Buffer is " + b2t_Text : "Buffer empty."));
+            } else if(appState === STATES.TUTOR_MODE) {
+                speak("Tutor mode. Type letter " + tutorTarget);
+            }
+        }
+
+        function goToMainMenu(){
+            changeState(STATES.MENU);
+            speak("Main menu");
+            announceMenu();
+        }
+
+        function speakHelpInstructions(){
+            speak("Global Controls. Hold A and B together anytime to hear the specific controls for your current screen.");
+        }
+
+        function handleInteractionInterrupt(){
+            resetIdleTimer();
+        }
+
+        function isTypingBraille(){
+            return chordBuffer.some(v => v === 1);
+        }
+
+        let idleTimer;
+        function resetIdleTimer(){
+            clearTimeout(idleTimer);
+            if(appState !== STATES.DISCONNECTED) {
+                idleTimer = setTimeout(()=>{
+                    readCurrentState();
+                }, 15000); // 15 seconds
+            }
+        }
+
+        function speakFeedback(message){
+            speak(message);
+            sendSerial("VIB:CONFIRM");
+        }
+
+        function speakError(message){
+            speak(message);
+            sendSerial("VIB:ERROR");
+        }
+
+        function speakOrientation(){
+            speak("BrailleX ready. " +
+                  "Three navigation buttons on top. " +
+                  "Six braille dots below. " +
+                  "System is entirely controlled via the navigation buttons.");
+        }
+
+        function announceMenu(){
+            speak("Menu " + MENU_OPTIONS[menuIndex].label);
+        }
+
+        function previewBraille(){
+            const chordStr = chordBuffer.join(',');
+            const letter = REVERSE_DICT[chordStr];
+            if(letter) speak("Possible letter " + letter);
+        }
+
+        function confirmCharacter(letter){
+            speakFeedback("Character " + (letter === ' ' ? 'space' : letter));
+        }
+
+        // --- UTILITIES ---
+        function toggleSerialMonitor() {
+            const panel = document.getElementById('serial-monitor');
+            panel.classList.toggle('monitor-open');
+        }
+
+        function addLog(msg, type = 'info') {
+            const logsDiv = document.getElementById('logs');
+            const time = new Date().toLocaleTimeString();
+            let colorClass = 'text-gray-400';
+            if (type === 'rx') colorClass = 'text-white font-bold';
+            if (type === 'tx') colorClass = 'text-gray-300';
+            if (type === 'error') colorClass = 'text-red-400 font-bold';
+            if (type === 'system') colorClass = 'text-white border-l-2 border-white pl-2';
+
+            const logEl = document.createElement('div');
+            logEl.className = `py-1 border-b border-gray-900 ${colorClass}`;
+            logEl.innerHTML = `<span class="opacity-50 mr-2">[${time}]</span><span class="uppercase tracking-wider opacity-70 text-[10px] mr-2">${type}:</span><span>${msg}</span>`;
+            
+            logsDiv.prepend(logEl);
+            if (logsDiv.children.length > 50) logsDiv.removeChild(logsDiv.lastChild);
+        }
+
+        function speak(text, save = true) {
+            if (synth.speaking) synth.cancel();
+            if (save) lastSpokenText = text;
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.rate = 1.15;
+            utterance.pitch = 1;
+            synth.speak(utterance);
+            addLog(`TTS: ${text}`, 'system');
+        }
+
+        async function sendSerial(cmd) {
+            if (!serialWriter) return;
+            try {
+                const data = new TextEncoder().encode(cmd + "\n");
+                await serialWriter.write(data);
+                addLog(cmd, "tx");
+            } catch (err) {
+                addLog("Write error: " + err.message, "error");
+            }
+        }
+
+        function sendServo(id, angle) {
+            sendSerial(`S${id}:${angle}`);
+        }
+
+        async function resetServos() {
+            for(let i=1; i<=6; i++) {
+                sendServo(i, SERVO_DOWN);
+                await wait(40); // Protect ESP32 current draw
+            }
+        }
+
+        // --- HARDWARE INTERFACE ---
+        async function connectDevice() {
+            try {
+                serialPort = await navigator.serial.requestPort();
+                await serialPort.open({ baudRate: 115200 });
+                serialWriter = serialPort.writable.getWriter();
+
+                speakOrientation();
+                setTimeout(() => {
+                    changeState(STATES.MENU);
+                    announceMenu();
+                }, 8000); 
+                
+                addLog("Hardware Connected", "system");
+                resetServos();
+                resetIdleTimer();
+                readLoop();
+            } catch (err) {
+                speakError("Connection failed");
+                addLog(`Conn Failed: ${err.message}`, "error");
+            }
+        }
+
+        async function readLoop() {
+            const decoder = new TextDecoder();
+            serialReader = serialPort.readable.getReader();
+
+            let buffer = "";
+
+            try {
+                while (true) {
+                    const { value, done } = await serialReader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value);
+                    let lines = buffer.split('\n');
+                    buffer = lines.pop(); 
+
+                    for (const line of lines) {
+                        const trimmed = line.trim();
+                        if (trimmed) handleESP32Input(trimmed);
+                    }
+                }
+            } catch (error) {
+                addLog(`Read err: ${error.message}`, 'error');
+            } finally {
+                if (serialReader) {
+                    try { serialReader.releaseLock(); } catch(e){}
+                }
+                changeState(STATES.DISCONNECTED);
+                speakError("Device disconnected.");
+            }
+        }
+
+        // --- INPUT ROUTER ---
+        function handleESP32Input(data) {
+            addLog(data, 'rx');
+            handleInteractionInterrupt();
+
+            // 1. BRAILLE BUTTONS (B1-B6)
+            const btnMatch = data.match(/^B([1-6])_(PRESS|RELEASE)$/);
+            if (btnMatch) {
+                const dotIndex = parseInt(btnMatch[1]) - 1;
+                const isPress = btnMatch[2] === 'PRESS';
+
+                if (isPress) { 
+                    chordBuffer[dotIndex] = chordBuffer[dotIndex] === 1 ? 0 : 1;
+                    if(chordBuffer[dotIndex] === 1){
+                        speak(`Dot ${dotIndex+1}`);
+                        sendServo(dotIndex + 1, SERVO_UP);
+                    } else {
+                        speak(`Dot ${dotIndex+1} released`);
+                        sendServo(dotIndex + 1, SERVO_DOWN);
+                    }
+                    sendSerial("VIB:DOT");
+                    updateUI();
+                    
+                    if(isAutoMode) resetAutoSubmitTimer();
+
+                    setTimeout(previewBraille, 200); 
+                }
+                return;
+            }
+
+            // 2. TOUCH SENSORS (T1-T3) - Used for Auto/Sensor progression triggers
+            const touchMatch = data.match(/^T([1-3])_(PRESS|RELEASE)$/);
+            if (touchMatch) {
+                const index = parseInt(touchMatch[1]) - 1;
+                const isPress = touchMatch[2] === 'PRESS';
+
+                touchStates[index] = isPress ? 1 : 0;
+                const anyTouchActive = touchStates.some(v => v === 1);
+
+                // Auto Mode Edge Detection (Lifting hand submits)
+                if(wasAnyTouchActive && !anyTouchActive){
+                    if (appState === STATES.TEXT_TO_BRAILLE && currentReadMode === 1 && isT2BStarted) { // SENSOR READ MODE
+                        actionNext();
+                    } else if(isAutoMode && (appState === STATES.BRAILLE_TO_TEXT || appState === STATES.AI_MODE)){ // AUTO WRITE/AI MODE
+                        if(isTypingBraille()) submitBrailleToText();
+                    }
+                }
+                wasAnyTouchActive = anyTouchActive;
+                return;
+            }
+
+            // 3. NAVIGATION BUTTONS (A, B, C)
+            const navMatch = data.match(/^([ABC])_(PRESS|RELEASE)$/);
+            if (navMatch) {
+                handleNavButton(navMatch[1], navMatch[2]);
+            }
+        }
+
+
+        // --- FEATURE SPECIFIC LOGIC ---
+        function toggleAutoMode() {
+            isAutoMode = !isAutoMode;
+            speakFeedback(isAutoMode ? "Automatic mode enabled. Use timing to advance." : "Manual mode enabled.");
+            updateUI();
+        }
+
+        function toggleReadMode() {
+            currentReadMode = (currentReadMode + 1) % 3;
+            speakFeedback(`${READ_MODES[currentReadMode]} read mode enabled.`);
+            updateUI();
+            if (currentReadMode === 2 && isT2BStarted) resetAutoSubmitTimer(); 
+        }
+
+        function resetAutoSubmitTimer() {
+            clearTimeout(autoSubmitTimer);
+            if (appState === STATES.TEXT_TO_BRAILLE && currentReadMode === 2 && isT2BStarted) { // AUTO READ
+                autoSubmitTimer = setTimeout(() => {
+                    actionNext();
+                }, 3000); // Auto read next after 3s
+            } else if (isAutoMode && (appState === STATES.BRAILLE_TO_TEXT || appState === STATES.AI_MODE)){
+                autoSubmitTimer = setTimeout(() => {
+                    if(isTypingBraille()) submitBrailleToText();
+                }, 2500); // Auto submit after 2.5s of inactivity
+            }
+        }
+
+        function submitBrailleToText() {
+            clearTimeout(autoSubmitTimer);
+            if(chordBuffer.every(v => v === 0)) return; // Ignore empty
+
+            const chordStr = chordBuffer.join(',');
+            const letter = REVERSE_DICT[chordStr];
+
+            if(letter){
+                b2t_Text += letter;
+                confirmCharacter(letter);
+            } else {
+                speakError("Unknown character");
+            }
+
+            chordBuffer = [0,0,0,0,0,0];
+            resetServos();
+            updateUI();
+        }
+
+        function startT2BVoiceRecognition() {
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!SpeechRecognition) {
+                speakError("Speech recognition not supported.");
+                return;
+            }
+            const recognition = new SpeechRecognition();
+            recognition.continuous = false;
+            
+            speak("Listening for dictation...");
+            
+            recognition.onresult = (event) => {
+                const transcript = event.results[0][0].transcript;
+                updateT2BText(transcript);
+            };
+            recognition.onerror = () => speakError("Error listening.");
+            recognition.start();
+        }
+
+        function updateT2BText(val) {
+            t2b_TargetText = val.toUpperCase() || " ";
+            t2b_Index = 0;
+            isT2BStarted = false;
+            resetServos();
+            speakFeedback("Text loaded. Press A to start reading.");
+            updateUI();
+        }
+
+        async function readCurrentT2BLetter() {
+            if(!t2b_TargetText || t2b_TargetText.length === 0) return;
+            const letter = t2b_TargetText[t2b_Index].toUpperCase();
+            speak("Letter " + (letter === ' ' ? 'space' : letter));
+            
+            const chord = BRAILLE_DICT[letter] || [0,0,0,0,0,0];
+            sendSerial(`CHORD:${chord.join('')}`); 
+            await wait(40);
+
+            for (let i = 0; i < 6; i++) {
+                sendServo(i + 1, chord[i] ? SERVO_UP : SERVO_DOWN);
+                await wait(40);
+            }
+
+            resetAutoSubmitTimer(); // Evaluates current read mode internally
+        }
+
+        function nextTutorLetter() {
+            const letters = Object.keys(BRAILLE_DICT).filter(k => k !== ' '); 
+            tutorTarget = letters[Math.floor(Math.random() * letters.length)];
+            chordBuffer = [0,0,0,0,0,0];
+            speak(`Type letter ${tutorTarget}`);
+            updateUI();
+        }
+
+        function submitTutorChord() {
+            const targetArr = BRAILLE_DICT[tutorTarget];
+            const isCorrect = chordBuffer.every((val, i) => val === targetArr[i]);
+            
+            const chordStr = chordBuffer.join(',');
+            const enteredLetter = REVERSE_DICT[chordStr];
+            const spokenLetter = enteredLetter ? (enteredLetter === ' ' ? 'space' : enteredLetter) : "unknown";
+
+            if (isCorrect) {
+                tutorScore++;
+                speakFeedback(`${spokenLetter}. Correct. Score ${tutorScore}`);
+                setTimeout(nextTutorLetter, 2000);
+            } else {
+                speakError(`${spokenLetter}. Incorrect. Try again.`);
+            }
+            
+            chordBuffer = [0,0,0,0,0,0];
+            resetServos();
+            updateUI();
+        }
+
+        function startVoiceAssistant() {
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!SpeechRecognition) {
+                speakError("Speech recognition not supported.");
+                return;
+            }
+            const recognition = new SpeechRecognition();
+            recognition.continuous = false;
+            speak("Listening.");
+            
+            if(document.getElementById('ai-status')) document.getElementById('ai-status').innerText = "Listening...";
+            
+            recognition.onresult = (event) => {
+                const transcript = event.results[0][0].transcript;
+                if(appState === STATES.AI_MODE) {
+                    document.getElementById('ai-status').innerText = "Thinking...";
+                    askAI(transcript);
+                } else {
+                    speakFeedback("Heard: " + transcript);
+                }
+            };
+            recognition.onerror = () => speakError("Error listening.");
+            recognition.start();
+        }
+
+        async function askAI(prompt){
+            try{
+                const response = await fetch(GEMINI_URL,{
+                    method:"POST",
+                    headers:{ "Content-Type":"application/json" },
+                    body:JSON.stringify({
+                        contents:[{
+                            parts:[{ text:`You are BrailleX, an assistant for a blind user. Answer very shortly in simple words, max 10 words. Prompt: ${prompt}` }]
+                        }]
+                    })
+                });
+                const data = await response.json();
+                const textResult = data.candidates?.[0]?.content?.parts?.[0]?.text || "I could not answer.";
+                
+                speakFeedback(textResult);
+                const aiElem = document.getElementById("ai-response");
+                if (aiElem) aiElem.innerText = textResult;
+                sendSerial(`TXT:${textResult.substring(0,16)}`);
+            }catch(err){
+                speakError("AI error");
+            }
+        }
+
+        // --- UI RENDER ENGINE ---
+        function changeState(newState) {
+            appState = newState;
+            clearTimeout(autoSubmitTimer);
+            
+            if(newState === STATES.BRAILLE_TO_TEXT) { b2t_Text = ""; chordBuffer = [0,0,0,0,0,0]; resetServos(); speak("Write mode."); }
+            if(newState === STATES.TEXT_TO_BRAILLE) { t2b_Index = 0; isT2BStarted = false; resetServos(); speak("Read mode. Press A to start."); } 
+            if(newState === STATES.TUTOR_MODE) { tutorScore = 0; chordBuffer = [0,0,0,0,0,0]; resetServos(); nextTutorLetter(); }
+            if(newState === STATES.AI_MODE) { b2t_Text = ""; chordBuffer = [0,0,0,0,0,0]; resetServos(); speak("A.I. mode."); } 
+            if(newState === STATES.MENU) { resetServos(); }
+            
+            document.getElementById('state-badge').innerText = newState;
+            const ind = document.getElementById('status-indicator');
+            ind.className = `w-4 h-4 rounded-full border border-gray-600 ${newState === STATES.DISCONNECTED ? 'bg-gray-800' : 'bg-white shadow-[0_0_10px_#fff] animate-pulse'}`;
+            
+            updateUI();
+        }
+
+        function generateServoControls(){
+            let html = "";
+            for(let i=1; i<=6; i++){
+                html += `
+                <div class="mb-2 bg-gray-900 p-2 border border-gray-700">
+                    <label class="flex justify-between text-xs font-bold text-gray-400 mb-1 uppercase tracking-widest">
+                        <span>Servo ${i}</span>
+                        <span id="servo-val-${i}" class="text-white">${SERVO_DOWN}&deg;</span>
+                    </label>
+                    <input type="range" min="${SERVO_DOWN}" max="${SERVO_UP}" value="${SERVO_DOWN}" 
+                        oninput="document.getElementById('servo-val-${i}').innerText = this.value + '&deg;'; sendServo(${i}, this.value)" 
+                        class="w-full h-1 bg-gray-800 appearance-none cursor-pointer">
+                </div>`;
+            }
+            return html;
+        }
+        
+        function getControlsLegend() {
+            let aActions, bActions, cActions;
+
+            // Context-Aware Legend Content
+            switch(appState) {
+                case STATES.MENU:
+                    aActions = ["<li><b class='text-white'>1x:</b> Select Mode</li>", "<li><b class='text-white'>Hold A+B:</b> Help Audio</li>"];
+                    bActions = ["<li><b class='text-white'>1x:</b> Stay</li>", "<li><b class='text-white'>Hold:</b> Exit App</li>"];
+                    cActions = ["<li><b class='text-white'>1x:</b> Next Option</li>", "<li><b class='text-white'>2x:</b> Read Screen</li>"];
+                    break;
+                case STATES.BRAILLE_TO_TEXT:
+                case STATES.AI_MODE:
+                    aActions = ["<li><b class='text-white'>1x:</b> Submit Letter</li>", "<li><b class='text-white'>2x:</b> Toggle Auto</li>", "<li><b class='text-white'>Hold:</b> Voice Input</li>"];
+                    bActions = ["<li><b class='text-white'>1x:</b> Go Back</li>", "<li><b class='text-white'>2x:</b> Delete Last</li>", "<li><b class='text-white'>Hold:</b> Main Menu</li>"];
+                    cActions = ["<li><b class='text-white'>1x:</b> Read Typed</li>", "<li><b class='text-white'>2x:</b> Read Screen</li>"];
+                    break;
+                case STATES.TEXT_TO_BRAILLE:
+                    aActions = ["<li><b class='text-white'>1x:</b> Start / Next</li>", "<li><b class='text-white'>2x:</b> Cycle Read Mode</li>"];
+                    bActions = ["<li><b class='text-white'>1x:</b> Exit Mode</li>", "<li><b class='text-white'>2x:</b> Prev Letter</li>", "<li><b class='text-white'>Hold:</b> Main Menu</li>"];
+                    cActions = ["<li><b class='text-white'>1x:</b> Next Letter</li>", "<li><b class='text-white'>Hold:</b> Dictate Text</li>"];
+                    break;
+                case STATES.TUTOR_MODE:
+                    aActions = ["<li><b class='text-white'>1x:</b> Submit Answer</li>", "<li><b class='text-white'>Hold A+B:</b> Help Audio</li>"];
+                    bActions = ["<li><b class='text-white'>1x:</b> Exit Tutor</li>", "<li><b class='text-white'>Hold:</b> Main Menu</li>"];
+                    cActions = ["<li><b class='text-white'>1x:</b> Skip Letter</li>", "<li><b class='text-white'>2x:</b> Read Target</li>"];
+                    break;
+                default:
+                    aActions = ["<li><b class='text-white'>1x:</b> Select</li>"];
+                    bActions = ["<li><b class='text-white'>1x:</b> Back</li>"];
+                    cActions = ["<li><b class='text-white'>1x:</b> Next</li>"];
+            }
+
+            return `
+            <div class="mt-4 bg-black border-2 border-gray-800 p-4 text-left text-xs text-gray-400 shadow-inner rounded-xl w-full max-w-2xl mx-auto flex-shrink-0">
+                <h4 class="text-white font-black uppercase tracking-widest mb-2 border-b border-gray-800 pb-1 flex justify-between">
+                    <span>Hardware Button Guide</span>
+                    <span class="text-[10px] text-gray-500">Hold A + B for Audio Guide</span>
+                </h4>
+                <div class="grid grid-cols-3 gap-2">
+                    <div class="border-r border-gray-800 pr-2">
+                        <span class="text-white font-bold text-sm mb-1 block">A (Action)</span>
+                        <ul class="space-y-0.5">${aActions.join("")}</ul>
+                    </div>
+                    <div class="border-r border-gray-800 px-2">
+                        <span class="text-white font-bold text-sm mb-1 block">B (Back)</span>
+                        <ul class="space-y-0.5">${bActions.join("")}</ul>
+                    </div>
+                    <div class="pl-2">
+                        <span class="text-white font-bold text-sm mb-1 block">C (Next)</span>
+                        <ul class="space-y-0.5">${cActions.join("")}</ul>
+                    </div>
+                </div>
+            </div>
+            `;
+        }
+
+        function updateUI() {
+            const container = document.getElementById('content-container');
+            const isMenu = appState === STATES.MENU;
+            
+            let contentHTML = "";
+
+            if (appState === STATES.DISCONNECTED) {
+                contentHTML = `
+                    <div class="mb-8">
+                        <svg class="w-24 h-24 mx-auto text-white mb-4 opacity-20" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="square" stroke-width="1" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                        </svg>
+                        <h2 class="text-3xl font-black text-white uppercase tracking-widest border-b-4 border-white pb-2 inline-block mb-2">Offline</h2>
+                        <p class="text-gray-400 mt-2 text-sm uppercase tracking-widest">Awaiting Hardware</p>
+                    </div>
+                    <button onclick="connectDevice()" class="bg-white text-black font-black py-4 px-8 text-xl uppercase tracking-widest w-full flex flex-col items-center gap-2 hover:bg-gray-300 transition-colors border-4 border-white max-w-sm mx-auto">
+                        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="square"><path d="m7 7 10 10-5 5V2l5 5L7 17"/></svg>
+                        Connect System
+                    </button>
+                `;
+            } 
+            else if (isMenu) {
+                let menuHtml = `<h2 class="text-3xl font-black mb-6 tracking-[0.2em] uppercase border-b-2 border-white pb-2">Main Menu</h2><div class="flex flex-col gap-3 max-w-sm mx-auto">`;
+                MENU_OPTIONS.forEach((opt, idx) => {
+                    const isSelected = idx === menuIndex;
+                    menuHtml += `
+                        <div class="p-4 transition-all duration-300 ${isSelected ? 'border-4 border-white bg-white text-black scale-105 shadow-[0_0_20px_rgba(255,255,255,0.3)]' : 'border-2 border-gray-800 bg-black text-gray-500'}">
+                            <span class="text-xl font-black tracking-widest uppercase">${opt.label}</span>
+                        </div>
+                    `;
+                });
+                menuHtml += `</div>`;
+                contentHTML = menuHtml;
+            }
+            else if (appState === STATES.BRAILLE_TO_TEXT) {
+                contentHTML = `
+                    <div class="flex justify-between items-center mb-4 border-b-2 border-gray-800 pb-2">
+                        <h2 class="text-2xl font-black uppercase tracking-widest">Write</h2>
+                        <div class="px-3 py-1 border-2 ${isAutoMode ? 'bg-white text-black border-white font-black shadow-[0_0_15px_#fff]' : 'border-gray-600 text-gray-400'} text-[10px] uppercase tracking-widest transition-colors">
+                            Auto Sub: ${isAutoMode ? 'ON' : 'OFF'}
+                        </div>
+                    </div>
+
+                    <div class="bg-black p-4 min-h-[100px] mb-4 border-4 border-white text-4xl font-black tracking-[0.3em] text-center break-all shadow-[0_0_30px_rgba(255,255,255,0.1)] flex items-center justify-center">
+                        <div><span>${b2t_Text}</span><span class="animate-pulse border-r-8 border-white ml-2 h-8 inline-block align-middle"></span></div>
+                    </div>
+
+                    ${generateBrailleDotsHTML(chordBuffer)}
+                `;
+            }
+            else if (appState === STATES.TEXT_TO_BRAILLE) {
+                const currentLetter = t2b_TargetText[t2b_Index]?.toUpperCase() || "";
+                const expectedChord = BRAILLE_DICT[currentLetter] || [0,0,0,0,0,0];
+                const textPrefix = t2b_TargetText.substring(0, t2b_Index);
+                const textSuffix = t2b_TargetText.substring(t2b_Index + 1);
+
+                contentHTML = `
+                    <div class="flex justify-between items-center mb-4 border-b-2 border-gray-800 pb-2">
+                        <h2 class="text-2xl font-black uppercase tracking-widest">Read</h2>
+                        <div class="flex gap-2 items-center">
+                            <span class="text-xs text-gray-500 uppercase tracking-widest">(Hold C to Dictate)</span>
+                            <div class="px-3 py-1 border-2 bg-white text-black border-white font-black shadow-[0_0_15px_#fff] text-[10px] uppercase tracking-widest transition-colors">
+                                ${READ_MODES[currentReadMode]} NEXT
+                            </div>
+                        </div>
+                    </div>
+
+                    <input type="text" value="${t2b_TargetText}" onchange="updateT2BText(this.value)" class="w-full bg-black text-white border-2 border-gray-600 p-3 mb-4 text-center text-lg font-black tracking-widest focus:border-white focus:outline-none uppercase placeholder-gray-700" placeholder="TYPE TO READ...">
+
+                    <div class="text-[10px] text-yellow-400 font-bold uppercase tracking-widest mb-1 ${!isT2BStarted ? 'animate-pulse' : 'opacity-0'}">
+                        ${!isT2BStarted ? "Press A to Start Reading" : "Reading"}
+                    </div>
+
+                    <div class="p-4 mb-4 text-2xl text-gray-500 border-4 border-gray-800 break-all leading-relaxed bg-black flex items-center justify-center min-h-[80px]">
+                        <div>${textPrefix}<span class="text-4xl text-black font-black bg-white px-3 py-1 mx-1 shadow-[0_0_20px_#fff] inline-block -translate-y-1">${currentLetter}</span>${textSuffix}</div>
+                    </div>
+
+                    ${generateBrailleDotsHTML(!isT2BStarted ? [0,0,0,0,0,0] : expectedChord)}
+                `;
+            }
+            else if (appState === STATES.TUTOR_MODE) {
+                contentHTML = `
+                    <h2 class="text-2xl font-black uppercase tracking-widest mb-4 border-b-2 border-gray-800 pb-2">Tutor</h2>
+                    <div class="border-4 border-white p-6 mb-6 bg-black shadow-[0_0_40px_rgba(255,255,255,0.1)] w-48 mx-auto">
+                        <div class="text-[6rem] font-black leading-none">${tutorTarget}</div>
+                    </div>
+                    
+                    ${generateBrailleDotsHTML(chordBuffer)}
+                    
+                    <div class="mt-6 flex items-center justify-center gap-4 border-t-2 border-gray-800 pt-4">
+                        <div class="text-lg font-bold uppercase tracking-widest text-gray-400">Score</div>
+                        <div class="text-2xl font-black text-white px-4 py-1 border-2 border-white">${tutorScore}</div>
+                    </div>
+                `;
+            }
+            else if (appState === STATES.AI_MODE) {
+                contentHTML = `
+                    <div class="flex justify-between items-center mb-4 border-b-2 border-gray-800 pb-2">
+                        <h2 class="text-2xl font-black uppercase tracking-widest flex items-center gap-2">A.I.</h2>
+                        <div class="px-3 py-1 border-2 ${isAutoMode ? 'bg-white text-black border-white font-black shadow-[0_0_15px_#fff]' : 'border-gray-600 text-gray-400'} text-[10px] uppercase tracking-widest transition-colors">
+                            Auto Sub: ${isAutoMode ? 'ON' : 'OFF'}
+                        </div>
+                    </div>
+
+                    <div id="ai-status" class="mb-4 text-xs font-bold uppercase tracking-widest text-gray-400 border border-gray-800 p-2">
+                        Braille Input, or Hold A to Speak
+                    </div>
+                    
+                    ${b2t_Text.length > 0 ? `
+                    <div class="bg-black p-4 mb-4 border-4 border-white text-3xl font-black tracking-widest text-center break-all shadow-inner min-h-[70px] flex items-center justify-center">
+                        <div>${b2t_Text}<span class="animate-pulse border-r-8 border-white ml-2 h-6 inline-block align-middle"></span></div>
+                    </div>` : ''}
+
+                    ${generateBrailleDotsHTML(chordBuffer)}
+
+                    <div id="ai-response" class="mt-6 p-4 bg-black border-2 border-gray-600 text-xl font-black uppercase tracking-wider text-white min-h-[6rem] flex items-center justify-center"></div>
+                `;
+            }
+            else if (appState === STATES.DEBUG) {
+                contentHTML = `
+                    <h2 class="text-2xl font-black uppercase tracking-widest mb-6 border-b-2 border-gray-800 pb-2">Dev System</h2>
+                    
+                    <div class="grid grid-cols-3 gap-4 mb-6">
+                        <button onclick="sendSerial('VIB:CONFIRM')" class="bg-black border-4 border-gray-800 p-4 hover:border-white transition-colors flex flex-col items-center gap-2">
+                            <span class="text-xl">✅</span><span class="text-xs font-black uppercase tracking-widest">Vibrate</span>
+                        </button>
+                        <button onclick="sendSerial('VIB:ERROR')" class="bg-black border-4 border-gray-800 p-4 hover:border-white transition-colors flex flex-col items-center gap-2">
+                            <span class="text-xl">❌</span><span class="text-xs font-black uppercase tracking-widest">Err Vib</span>
+                        </button>
+                        <button onclick="sendSerial('RESET')" class="bg-white text-black border-4 border-white p-4 hover:bg-gray-300 transition-colors flex flex-col items-center gap-2 shadow-[0_0_20px_rgba(255,255,255,0.5)]">
+                            <span class="text-xl">🔄</span><span class="text-xs font-black uppercase tracking-widest">Reset</span>
+                        </button>
+                    </div>
+
+                    <div class="bg-black p-4 border-2 border-gray-700 mb-4 max-w-sm mx-auto w-full">
+                        <h3 class="text-lg font-black mb-4 uppercase tracking-widest border-b border-gray-800 pb-2 text-left">Direct Servos</h3>
+                        <div class="h-32 overflow-y-auto pr-2 custom-scrollbar">
+                            ${generateServoControls()}
+                        </div>
+                    </div>
+                `;
+            }
+
+            // Append standard legend if connected
+            if (appState !== STATES.DISCONNECTED) {
+                contentHTML += getControlsLegend();
+            }
+
+            container.innerHTML = contentHTML;
+        }
+
+        function generateBrailleDotsHTML(chordArray) {
+            const order = [0, 3, 1, 4, 2, 5]; 
+            let html = `<div class="grid grid-cols-2 gap-x-10 gap-y-4 justify-items-center max-w-[160px] mx-auto bg-black p-6 border-4 border-gray-800 shadow-[inset_0_0_40px_rgba(255,255,255,0.05)]">`;
+            order.forEach(idx => {
+                const isActive = chordArray[idx] === 1;
+                html += `<div class="dot ${isActive ? 'active' : 'inactive'}"></div>`;
+            });
+            html += `</div>`;
+            return html;
+        }
+
+        updateUI();
+
+    </script>
+</body>
+</html>
